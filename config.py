@@ -4,9 +4,14 @@
 """
 
 import os
+from pathlib import Path
 
 
 def _env(name: str, default: str = "") -> str:
+    """Читает значение из переменной окружения или из файла ``NAME_FILE``."""
+    file_name = os.environ.get(f"{name}_FILE", "").strip()
+    if file_name:
+        return Path(file_name).read_text(encoding="utf-8").strip()
     return os.environ.get(name, default).strip()
 
 

@@ -50,12 +50,18 @@ class TimetableFile:
 
 
 def _is_schedule_pdf(href: str, title: str) -> bool:
-    """Отсекаем служебные файлы («Кураторы групп...», «График консультаций...»)."""
+    """Оставляет только актуальные файлы с названиями из двух и более групп."""
     hay = (href + " " + title).lower()
     for junk in ("куратор", "консультаци", "график"):
         if junk in hay:
             return False
-    return True
+
+    # На странице остаются старые архивные PDF вроде «15-21,16-22.pdf».
+    # Они недоступны и не относятся к текущим группам. Рабочие файлы названы
+    # по двум и более группам через дефис: «23-29-24-25.pdf».
+    filename = Path(urlparse(href).path).name
+    pattern = r"[0-9]{2}-[0-9]{2}(?:-[0-9]{2}-[0-9]{2})+[.]pdf"
+    return bool(re.fullmatch(pattern, filename, re.IGNORECASE))
 
 
 class TimetableSource:

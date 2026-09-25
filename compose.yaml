@@ -1,0 +1,33 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: timetable-max-bot:latest
+    container_name: timetable-max-bot
+    restart: unless-stopped
+    environment:
+      MAX_BOT_TOKEN_FILE: /run/secrets/max_bot_token
+      TIMEZONE: ${TIMEZONE:-Asia/Yekaterinburg}
+      DOWNLOAD_DIR: /app/data/cache_files
+      SUBSCRIPTIONS_FILE: /app/data/subscriptions.json
+    secrets:
+      - max_bot_token
+    volumes:
+      - timetable-data:/app/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+secrets:
+  max_bot_token:
+    file: ${MAX_BOT_TOKEN_FILE:-/home/ubuntu0/.config/timetable-bot/max_bot_token.txt}
+
+volumes:
+  timetable-data:
+    name: timetable-max-bot-data
