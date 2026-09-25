@@ -80,10 +80,11 @@ class TimetableSource:
 
     def _download(self, file: TimetableFile) -> Path:
         dest = Path(config.DOWNLOAD_DIR) / f"{file.key}_{file.filename}"
-        if dest.exists() and dest.stat().st_size > 0:
+        if dest.exists() and dest.stat().st_size > 1024:
             return dest
         last_err: Exception | None = None
-        for attempt in range(3):  # сайт иногда отдаёт пустой ответ — повторяем
+        for attempt in range(5):  # collegelan.ru иногда отдаёт пустой ответ —
+            # повторные запросы помогают; в конце чистим битый кэш
             try:
                 resp = self._session.get(
                     file.url, timeout=config.HTTP_TIMEOUT * 3
@@ -98,6 +99,8 @@ class TimetableSource:
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
                 time.sleep(1 + attempt)
+        if dest.exists():
+            dest.unlink(missing_ok=True)  # убираем пустой/битый кэш
         raise RuntimeError(f"не скачался {file.url}: {last_err}")
 
     @staticmethod
@@ -170,7 +173,8 @@ class TimetableSource:
 
             for f in new_files:
                 old = next((o for o in self._files if o.url == f.url), None)
-                if old and old.path and Path(old.path).exists():
+                if (old and old.path and Path(old.path).exists()
+                        and Path(old.path).stat().st_size > 1024):
                     f.path = old.path
                 else:
                     try:

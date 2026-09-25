@@ -1,2 +1,2 @@
-# Cache files
-cache_files/
+__pycache__/
+*.pyc
