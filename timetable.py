@@ -1,33 +1,41 @@
-"""Загрузка и парсинг расписания с сайта колледжа ЛПК (Лангепас).
+"""Источник расписания: сайт collegelan.ru + разбор PDF в текст.
 
-Модуль ходит на страницу(ы) расписания, собирает ссылки на файлы
-(pdf/doc/xls и т.п.), кэширует список и сами файлы на диске,
-чтобы не качать их повторно при каждом запросе студента.
+Модуль:
+  1. качает страницу «Расписание занятий» и собирает ссылки на PDF-файлы;
+  2. скачивает каждый PDF (с кэшированием на диске);
+  3. разбирает PDF модулем parse и строит индекс: группа -> расписание по дням;
+  4. выдаёт готовый текст расписания по запросу студента.
+
+PDF-файлы на сайте разложены по файлам групп, например «23-29-24-25.pdf»
+содержит расписание групп 23-29, 24-20, 24-21(2С), 24-23(П), 24-25.
 """
 
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import hashlib
 import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, unquote
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
 import config
+import parse
 
 
 @dataclass
 class TimetableFile:
-    """Один файл расписания, найденный на сайте."""
+    """Один PDF с расписанием, найденный на сайте."""
 
-    title: str          # текст ссылки / название группы или файла
+    title: str          # имя файла без расширения
     url: str            # абсолютный URL файла
-    path: Path = field(default=None)  # локальный путь (после скачивания)
+    path: Path | None = field(default=None)   # локальный путь после скачивания
+    groups: list[str] = field(default_factory=list)  # группы внутри файла
 
     @property
     def key(self) -> str:
@@ -36,82 +44,64 @@ class TimetableFile:
 
     @property
     def filename(self) -> str:
-        """Имя файла для отправки в мессенджер."""
-        base = unquote(Path(urlparse(self.url).path).name) or "raspisanie"
-        # очищаем «неудобные» символы
-        return re.sub(r"[\\/:*?\"<>|]+", "_", base)
+        """Имя файла на диске."""
+        base = unquote(Path(urlparse(self.url).path).name) or "raspisanie.pdf"
+        return re.sub(r"[\\/:*?\"<>| ]+", "_", base)
 
 
-def _norm_title(text: str) -> str:
-    text = re.sub(r"\s+", " ", text or "").strip()
-    return text
-
-
-def _guess_group(title: str) -> str | None:
-    """Пытаемся вычленить название группы из заголовка/имени файла.
-
-    Типичные форматы: «Расписание гр. ИС-21», «3-ПД», «Группа 401» и т.п.
-    """
-    m = re.search(
-        r"(?:гр(?:уппа|\.)?\s*[-:]?\s*)([А-Яа-яA-Za-z0-9\-_/]{2,15})",
-        title,
-        re.IGNORECASE,
-    )
-    if m and not m.group(1).lower().startswith(("уппа", "рупп")):
-        return m.group(1)
-    # самостоятельные обозначения вида ИС-21, 3-ПД, ПД-21-1, 401 (только с дефисом/буквой)
-    m = re.search(r"\b([А-Я]{1,4}[-_]\d{1,2}(?:[-_]\d)?|\d[-_][А-Я]{1,4})\b", title)
-    if m:
-        return m.group(1)
-    # просто номер группы цифрами: «401 группа» / «группа 401»
-    m = re.search(r"\b(\d{3,4})\b(?:\s*(?:группа|гр\.?))?|\b(?:группа|гр\.?)\s*(\d{3,4})\b", title)
-    if m:
-        return m.group(1) or m.group(2)
-    return None
-
-
-TRANSLIT = str.maketrans({
-    "a": "а", "b": "б", "c": "ц", "d": "д", "e": "е", "f": "ф", "g": "г",
-    "h": "х", "i": "и", "j": "й", "k": "к", "l": "л", "m": "м", "n": "н",
-    "o": "о", "p": "п", "r": "р", "s": "с", "t": "т", "u": "у", "v": "в",
-    "y": "ы", "z": "з",
-})
-
-
-def _norm_query(q: str) -> str:
-    """Нормализует запрос: нижний регистр, дефисы вместо подчёркиваний/пробелов."""
-    return re.sub(r"[_\s]+", "-", q.strip().lower())
+def _is_schedule_pdf(href: str, title: str) -> bool:
+    """Отсекаем служебные файлы («Кураторы групп...», «График консультаций...»)."""
+    hay = (href + " " + title).lower()
+    for junk in ("куратор", "консультаци", "график"):
+        if junk in hay:
+            return False
+    return True
 
 
 class TimetableSource:
-    """Клиент сайта с расписанием + локальный кэш."""
+    """Клиент сайта + кэш разобранных расписаний по группам."""
 
     def __init__(self) -> None:
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": config.USER_AGENT})
         self._files: list[TimetableFile] = []
+        # canonical group name -> {weekday: DaySchedule}
+        self._index: dict[str, dict[int, parse.DaySchedule]] = {}
         self._loaded_at: float = 0.0
         self._lock = asyncio.Lock()
         Path(config.DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
-    # ---------- низкоуровневые сетевые операции (в отдельном потоке) ----
-    def _fetch_page(self, page_path: str) -> str:
+    # ---------- сеть ------------------------------------------------------
+    def _fetch_page(self, page_path: str) -> tuple[str, str]:
         url = urljoin(config.BASE_URL + "/", page_path.lstrip("/"))
         resp = self._session.get(url, timeout=config.HTTP_TIMEOUT)
         resp.raise_for_status()
-        return resp.text
+        return resp.text, url
 
     def _download(self, file: TimetableFile) -> Path:
         dest = Path(config.DOWNLOAD_DIR) / f"{file.key}_{file.filename}"
         if dest.exists() and dest.stat().st_size > 0:
             return dest
-        resp = self._session.get(file.url, timeout=config.HTTP_TIMEOUT * 3)
-        resp.raise_for_status()
-        dest.write_bytes(resp.content)
-        return dest
+        last_err: Exception | None = None
+        for attempt in range(3):  # сайт иногда отдаёт пустой ответ — повторяем
+            try:
+                resp = self._session.get(
+                    file.url, timeout=config.HTTP_TIMEOUT * 3
+                )
+                resp.raise_for_status()
+                if not resp.content.startswith(b"%PDF"):
+                    raise ValueError(f"файл не является PDF: {file.url}")
+                tmp = dest.with_suffix(".part")
+                tmp.write_bytes(resp.content)
+                tmp.replace(dest)
+                return dest
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                time.sleep(1 + attempt)
+        raise RuntimeError(f"не скачался {file.url}: {last_err}")
 
-    # ---------- сбор ссылок ---------------------------------------------
-    def _parse_page(self, html: str, page_url: str) -> list[TimetableFile]:
+    @staticmethod
+    def _parse_page(html: str, page_url: str) -> list[TimetableFile]:
         soup = BeautifulSoup(html, "html.parser")
         found: dict[str, TimetableFile] = {}
         for a in soup.find_all("a", href=True):
@@ -120,26 +110,47 @@ class TimetableSource:
             lowered = abs_url.lower().split("?")[0]
             if not lowered.endswith(config.FILE_EXTENSIONS):
                 continue
-            title = _norm_title(a.get_text()) or _norm_title(a.get("title", ""))
-            if not title:
-                title = unquote(Path(urlparse(abs_url).path).name)
-            # фильтр по ключевым словам (если задан и ссылка ведёт на HTML-страницу
-            # с расписанием внутри — расширения уже отсекут лишнее)
-            if config.LINK_KEYWORDS:
-                haystack = (title + " " + abs_url).lower()
-                # если в имени файла явно есть расширение расписания — пропускаем
-                if not any(k in haystack for k in config.LINK_KEYWORDS):
-                    continue
+            title = (a.get_text(strip=True)
+                     or a.get("title", "")
+                     or unquote(Path(urlparse(abs_url).path).stem))
+            if config.LINK_KEYWORDS and not any(
+                k in (title + " " + abs_url).lower()
+                for k in config.LINK_KEYWORDS
+            ):
+                continue
+            if not _is_schedule_pdf(abs_url, title):
+                continue
             found[abs_url] = TimetableFile(title=title, url=abs_url)
         return list(found.values())
 
+    # ---------- индекс групп ----------------------------------------------
+    @staticmethod
+    def _canon(group: str) -> str:
+        return re.sub(r"\s+", "", group).upper()
+
+    def _build_index(self) -> None:
+        """Разбирает все скачанные PDF и собирает карту группа -> дни."""
+        index: dict[str, dict[int, parse.DaySchedule]] = {}
+        for f in self._files:
+            if not f.path or not Path(f.path).exists():
+                continue
+            try:
+                groups = parse.find_group_in_pdf(f.path)
+            except Exception:  # noqa: BLE001 — битый/не тот pdf
+                continue
+            f.groups = groups
+            for g in groups:
+                days = parse.parse_pdf(f.path, g)
+                if days:
+                    index[self._canon(g)] = {d.weekday: d for d in days}
+        self._index = index
+
+    # ---------- публичное API ---------------------------------------------
     async def refresh(self, force: bool = False) -> list[TimetableFile]:
-        """Обновляет список файлов с сайта (с учётом TTL-кэша)."""
+        """Обновляет список файлов с сайта и пересобирает индекс групп."""
         async with self._lock:
-            fresh = (
-                time.time() - self._loaded_at < config.CACHE_TTL_MINUTES * 60
-            )
-            if fresh and self._files and not force:
+            fresh = time.time() - self._loaded_at < config.CACHE_TTL_MINUTES * 60
+            if fresh and self._index and not force:
                 return self._files
 
             files: dict[str, TimetableFile] = {}
@@ -147,56 +158,91 @@ class TimetableSource:
             for page in config.TIMETABLE_PAGES:
                 page_url = urljoin(config.BASE_URL + "/", page.lstrip("/"))
                 try:
-                    html = await asyncio.to_thread(self._fetch_page, page)
+                    html, _ = await asyncio.to_thread(self._fetch_page, page)
                     for f in self._parse_page(html, page_url):
                         files[f.url] = f
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"{page_url}: {exc}")
-            if files:
-                self._files = sorted(files.values(), key=lambda f: f.title.lower())
+
+            new_files = sorted(files.values(), key=lambda f: f.title.lower())
+            changed = {f.url for f in new_files} != {f.url for f in self._files}
+            need_reindex = force or changed or not self._index
+
+            for f in new_files:
+                old = next((o for o in self._files if o.url == f.url), None)
+                if old and old.path and Path(old.path).exists():
+                    f.path = old.path
+                else:
+                    try:
+                        f.path = await asyncio.to_thread(self._download, f)
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"{f.url}: {exc}")
+
+            if new_files:
+                self._files = new_files
                 self._loaded_at = time.time()
-            elif errors and not self._files:
+            if need_reindex and self._files:
+                await asyncio.to_thread(self._build_index)
+            if not self._files and errors:
                 raise RuntimeError("; ".join(errors))
             return self._files
-
-    # ---------- публичные методы ----------------------------------------
-    @staticmethod
-    def group_of(file: TimetableFile) -> str | None:
-        return _guess_group(file.title)
-
-    def find_by_query(self, query: str) -> list[TimetableFile]:
-        """Ищет файлы по названию группы или тексту запроса.
-
-        Учитывает варианты написания: ИС-21 / ис21 / is-21 (транслитерация),
-        дефис/подчёркивание/пробел как разделители.
-        """
-        q = _norm_query(query)
-        if not q:
-            return []
-        q_tr = q.translate(TRANSLIT)  # «is-21» -> «ис-21»
-        variants = {q, q_tr}
-        result = []
-        for f in self._files:
-            candidates = {
-                _norm_query(f.title),
-                _norm_query(Path(f.filename).stem),
-            }
-            if any(v in c for v in variants for c in candidates):
-                result.append(f)
-        return result
-
-    async def get_file(self, file: TimetableFile) -> Path:
-        """Скачивает файл (или берёт из кэша) и возвращает локальный путь."""
-        if file.path and Path(file.path).exists():
-            return Path(file.path)
-        path = await asyncio.to_thread(self._download, file)
-        file.path = path
-        return path
 
     @property
     def files(self) -> list[TimetableFile]:
         return list(self._files)
 
-    @property
-    def loaded_at(self) -> float:
-        return self._loaded_at
+    def all_groups(self) -> list[str]:
+        return sorted(self._index.keys())
+
+    def get_days(self, group: str) -> dict[int, parse.DaySchedule] | None:
+        """Дни недели для точного названия группы."""
+        return self._index.get(self._canon(group))
+
+    def match_groups(self, query: str) -> list[str]:
+        """Подходящие под запрос канонические названия групп.
+
+        «2329», «23-29», «23_29», «23 29» -> 23-29; «24-21» -> 24-21(2С).
+        """
+        q = re.sub(r"[\s_\-/.]+", "", query.strip()).upper()
+        if not q:
+            return []
+        exact, partial = [], []
+        for g in self.all_groups():
+            gc = re.sub(r"[\s_\-/.()А-Я]", "", g)  # «24-21(2С)» -> «2421»
+            if gc == q or g == self._canon(query):
+                exact.append(g)
+            elif q in gc or gc.startswith(q):
+                partial.append(g)
+        return exact or partial
+
+    def schedule_text(self, group: str) -> str:
+        days = self.get_days(group)
+        if not days:
+            return ""
+        ordered = [days[w] for w in sorted(days)]
+        return parse.format_schedule(ordered, group)
+
+    def upcoming_lessons(
+        self, group: str, now, limit: int = 3
+    ) -> list[tuple[parse.Lesson, object]]:
+        """Ближайшие занятия группы (с реальными датами) от момента `now`.
+
+        Возвращает [(Lesson, datetime начала)], Lesson.start уже проставлен
+        парсером на ближайшие даты относительно сегодня.
+        """
+        days = self.get_days(group)
+        if not days:
+            return []
+        result = []
+        for w in sorted(days):
+            for ls in days[w].lessons:
+                if ls.start is None:
+                    continue
+                start = ls.start
+                # парсер ставит дату «ближайший этот день недели»;
+                # если пара уже прошла сегодня — берём следующую неделю
+                while start <= now:
+                    start = start + dt.timedelta(days=7)
+                result.append((ls, start))
+        result.sort(key=lambda t: t[1])
+        return result[:limit]
