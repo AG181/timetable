@@ -113,18 +113,32 @@ _sent: set[tuple[int, str, int]] = set()
 
 # ---------------------------------------------------------------- helpers ---
 
+def sender_user_id(msg: Message) -> int | None:
+    """user_id автора сообщения (для подписок на уведомления)."""
+    if msg.sender is not None and msg.sender.user_id is not None:
+        return msg.sender.user_id
+    # в личных диалогах recipient == сам пользователь
+    if msg.chat_id is None and msg.recipient.user_id is not None:
+        return msg.recipient.user_id
+    return None
+
+
 def recipient_of(msg: Message) -> dict:
+    """Аргументы для Bot.send_message, отвечающие в тот же чат/диалог."""
     if msg.chat_id is not None:
         return {"chat_id": msg.chat_id}
-    uid = msg.recipient.user_id or (msg.sender.user_id if msg.sender else None)
-    return {"user_id": uid}
+    return {"user_id": msg.recipient.user_id}
 
 
 def kb_groups(groups: list[str]) -> InlineKeyboard:
+    """Кнопки со списком групп; для каждой — расписание и подписка на напоминания."""
     kb = InlineKeyboard()
-    buttons = [Button.callback(g, f"g:{g}") for g in groups[:60]]
-    for i in range(0, len(buttons), 4):
-        kb.row(*buttons[i:i + 4])
+    buttons = []
+    for g in groups[:60]:
+        buttons.append(Button.callback(g, f"g:{g}"))
+        buttons.append(Button.callback("🔔", f"n:{g}"))
+    for i in range(0, len(buttons), 6):   # 3 группы в ряд (по 2 кнопки на группу)
+        kb.row(*buttons[i:i + 6])
     return kb
 
 
@@ -236,7 +250,7 @@ async def cmd_notify(msg: Message) -> None:
                          "Посмотри список через /groups.")
         return
     group = matches[0]
-    uid = msg.sender.user_id if msg.sender else msg.recipient.user_id
+    uid = sender_user_id(msg)
     if uid is None:
         await msg.answer("Не могу определить ваш user_id 😕")
         return
@@ -255,7 +269,7 @@ async def cmd_notify(msg: Message) -> None:
 
 @BOT.message(Command("off"))
 async def cmd_off(msg: Message) -> None:
-    uid = msg.sender.user_id if msg.sender else msg.recipient.user_id
+    uid = sender_user_id(msg)
     if uid is not None and SUBS.remove(uid):
         await msg.answer("🔕 Напоминания отключены.")
     else:
@@ -272,18 +286,33 @@ async def any_text(msg: Message) -> None:
 
 
 @BOT.callback(lambda u: bool(u.callback and u.callback.payload
-                             and u.callback.payload.startswith("g:")))
+                             and u.callback.payload.split(":")[0] in ("g", "n")))
 async def cb_group(cb: Callback) -> None:
-    group = (cb.payload or "").split(":", 1)[-1]
+    payload = cb.payload or ""
+    kind, _, group = payload.partition(":")
+    if kind == "n":  # кнопка «🔔 Включить напоминания» из /groups
+        if cb.user is not None and cb.user.user_id is not None:
+            SUBS.set(cb.user.user_id, group)
+            await cb.answer(
+                f"🔔 Напоминания за {config.NOTIFY_BEFORE_MINUTES} мин "
+                f"до пар группы {group} включены. Отключить: /off"
+            )
+        else:
+            await cb.answer("Не удалось определить пользователя 😕")
+        return
     text = SOURCE.schedule_text(group)
     if not text:
         await cb.answer("Данные устарели — запросите /groups заново.")
         return
-    to = recipient_of(cb.message) if cb.message is not None else \
-        ({"user_id": cb.user.user_id} if cb.user else None)
-    await cb.answer("Отправляю расписание…")
-    if to:
-        await cb.bot.send_message(text, **to)
+    if cb.message is not None:
+        to = recipient_of(cb.message)
+    elif cb.user is not None:
+        to = {"user_id": cb.user.user_id}
+    else:
+        to = None
+    await cb.answer(f"Расписание группы {group}")
+    if to and (to.get("user_id") is not None or to.get("chat_id") is not None):
+        await BOT.bot.send_message(text, **to)
 
 
 # ------------------------------------------------------------ notifications -
@@ -304,7 +333,13 @@ async def send_reminder(bot: Bot, user_id: int, group: str, lesson,
 
 
 async def notification_loop(bot: Bot) -> None:
-    """Раз в NOTIFY_CHECK_INTERVAL_SECONDS проверяем: не пора ли предупредить."""
+    """Раз в NOTIFY_CHECK_INTERVAL_SECONDS проверяем: не пора ли предупредить.
+
+    Важный нюанс: parse._fill_time проставляет lesson.start один раз при
+    разборе PDF (на «ближайший» день недели от даты разбора). Поэтому здесь
+    время начала каждой пары пересчитывается на актуальную дату, а не
+    берётся из кэшированного объекта.
+    """
     log.info("Цикл уведомлений запущен (tz=%s, за %d мин до пары)",
              config.TIMEZONE, config.NOTIFY_BEFORE_MINUTES)
     while True:
@@ -317,25 +352,29 @@ async def notification_loop(bot: Bot) -> None:
                 continue
             now = now_local()
             cutoff = now + dt.timedelta(minutes=config.NOTIFY_BEFORE_MINUTES)
+            todays = {user_id: (SOURCE.get_days(group) or {}).get(now.weekday())
+                      for user_id, group in subs}
             for user_id, group in subs:
-                days = SOURCE.get_days(group) or {}
-                todays = days.get(now.weekday())
-                if not todays:
+                day = todays[user_id]
+                if not day:
                     continue
-                for lesson in todays.lessons:
+                for lesson in day.lessons:
                     if lesson.start is None:
                         continue
+                    # пересчитываем начало пары на сегодняшний день
+                    start = dt.datetime.combine(now.date(),
+                                                lesson.start.time())
                     mark = (user_id, now.date().isoformat(), lesson.num)
                     if mark in _sent:
                         continue
                     # окно: начало пары в пределах [now, now+5мин]
-                    if now <= lesson.start <= cutoff:
+                    if now <= start <= cutoff:
                         try:
                             await send_reminder(bot, user_id, group,
-                                                lesson, lesson.start)
+                                                lesson, start)
                             _sent.add(mark)
                             log.info("Уведомление %s: пара %d в %s",
-                                     user_id, lesson.num, lesson.start)
+                                     user_id, lesson.num, start)
                         except Exception:  # noqa: BLE001
                             log.exception("Не удалось отправить уведомление")
             # чистим отметки за прошлые дни
@@ -352,11 +391,17 @@ async def notification_loop(bot: Bot) -> None:
 # ------------------------------------------------------------------- main ---
 
 async def async_main() -> None:
-    await BOT.start_polling(handle_signals=False)
+    """Один event loop: поллинг MAX + фоновый цикл уведомлений."""
+    polling = asyncio.create_task(BOT.start_polling(timeout=30, limit=100))
+    notifier = asyncio.create_task(notification_loop(BOT.bot))
     try:
-        await asyncio.create_task(notification_loop(BOT.bot))
+        await polling
     finally:
-        await BOT.close()
+        notifier.cancel()
+        try:
+            await notifier
+        except asyncio.CancelledError:
+            pass
 
 
 def main() -> None:
@@ -368,7 +413,7 @@ def main() -> None:
     log.info("Старт бота. Сайт: %s%s", config.BASE_URL,
              config.TIMETABLE_PAGES[0] if config.TIMETABLE_PAGES else "")
     try:
-        BOT.run()          # внутри запускается asyncio loop
+        asyncio.run(async_main())
     except KeyboardInterrupt:
         pass
 
